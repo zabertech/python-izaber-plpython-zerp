@@ -255,16 +255,16 @@ class IPLPY(izaber.plpython.base.IPLPY):
 
         return "OK"
 
-    def trigger_stock_move_update_row(self):
+    def trigger_stock_move_changes(self):
         """ This trigger should execute when a stock.move is created.
             The purpose of this function is to flag in the
             product_product table what records will need quantity
             recalculated
         """
-        old = self.TD['old']
-        new = self.TD['new']
+        old = self.TD['old'] or {}
+        new = self.TD['new'] or {}
         dirty_product_ids = []
-        for product_id in [ old['product_id'], new['product_id'] ]:
+        for product_id in [ old.get('product_id'), new.get('product_id') ]:
             if not product_id: continue
             dirty_product_ids.append(product_id)
 
@@ -345,17 +345,17 @@ CREATE INDEX pps_basic_search_ndx ON product_product_summary ( default_code, rev
 
 
 
-CREATE OR REPLACE FUNCTION fn_trigger_stock_move_update_row()
+CREATE OR REPLACE FUNCTION fn_trigger_stock_move_changes()
 RETURNS TRIGGER AS
 $$
     from izaber.plpython.zerp import init_plpy
     iplpy = init_plpy(globals())
-    return iplpy.trigger_stock_move_update_row()
+    return iplpy.trigger_stock_move_changes()
 $$
 LANGUAGE plpython3u;
 
-CREATE TRIGGER      trig_default_code
-AFTER UPDATE OF     product_uom,
+CREATE TRIGGER      trig_stock_move_qty_changes_update
+BEFORE UPDATE OF    product_uom,
                     product_qty,
                     location_id,
                     location_dest_id,
@@ -364,7 +364,16 @@ AFTER UPDATE OF     product_uom,
 ON
                     stock_move
 FOR EACH ROW
-EXECUTE PROCEDURE   fn_trigger_stock_move_update_row()
+EXECUTE PROCEDURE   fn_trigger_stock_move_changes()
+;
+
+
+CREATE TRIGGER      trig_stock_move_qty_changes_insdel
+BEFORE INSERT OR DELETE
+ON
+                    stock_move
+FOR EACH ROW
+EXECUTE PROCEDURE   fn_trigger_stock_move_changes()
 ;
 
 
