@@ -31,7 +31,9 @@ class IPLPY(izaber.plpython.base.IPLPY):
         return self.GD['uom_data_cache'][uom_id]
 
     def uom_convert(self, from_uom_id, qty, to_uom_id ):
-        """
+        """ Replication of the Zerp's UoM conversion function that
+            takes one UoM amount to a another UoM based upon the
+            conversion amount
         """
         # Just basics where if not defined, just move along
         if not from_uom_id \
@@ -279,6 +281,44 @@ class IPLPY(izaber.plpython.base.IPLPY):
                 dirty_product_ids=",".join(map(str,dirty_product_ids))
             ))
 
+    def trigger_location_changes(self):
+        """ This trigger should execute when a location is changed
+            The purpose of this function is to flag in the
+            product_product table what records will need quantity
+            recalculated
+        """
+        old = self.TD['old'] or {}
+        new = self.TD['new'] or {}
+
+        # Go through the stock_move list for any changes that might
+        data = self.q("""
+            SELECT  DISTINCT product_id
+            FROM    stock_move
+            WHERE
+                    location_id = {location_id}
+                OR  location_dest_id = {location_id}
+        """.format(
+            location_id = old.get('id')
+        ))
+
+        dirty_product_ids = []
+        for row in data:
+            product_id = row['product_id']
+            if not product_id: continue
+            dirty_product_ids.append(product_id)
+
+        if dirty_product_ids:
+            self.q("""
+                UPDATE  product_product_dirty_tracker
+                SET
+                        qty_dirty='t'
+                WHERE
+                        id in ({dirty_product_ids})
+            """.format(
+                dirty_product_ids=",".join(map(str,dirty_product_ids))
+            ))
+
+
 """
 
 CREATE OR REPLACE FUNCTION fn_uom_convert(from_uom_id integer,qty numeric,to_uom_id integer)
@@ -291,7 +331,6 @@ $$
 LANGUAGE plpython3u;
 select fn_uom_convert(37,1,1);
 
-
 CREATE OR REPLACE FUNCTION fn_get_stock_locations()
 RETURNS INT[] AS
 $$
@@ -302,7 +341,6 @@ $$
 LANGUAGE plpython3u;
 select fn_get_stock_locations();
 
-
 CREATE OR REPLACE FUNCTION fn_get_product_available(product_id integer)
 RETURNS TEXT AS
 $$
@@ -312,38 +350,6 @@ $$
 $$
 LANGUAGE plpython3u;
 select fn_get_product_available(1633);
-
-
-
-
-
-DROP TABLE product_product_summary;
-CREATE TABLE product_product_summary (
-    id integer primary key REFERENCES product_product ON DELETE CASCADE,
-    default_code varchar(64),
-    name varchar(128),
-    revision integer,
-    active boolean,
-    sale_ok boolean,
-    purchase_ok boolean,
-    list_price numeric(16,5),
-    type varchar(16),
-    loc_rack varchar(255),
-    bom text,
-    bom_dirty boolean,
-
-    qty_available numeric(16,5),
-    virtual_available numeric(16,5),
-    incoming_qty numeric(16,5),
-    outgoing_qty numeric(16,5),
-    qty_dirty boolean
-);
-CREATE INDEX pps_qty_dirty_ndx ON product_product_summary ( qty_dirty );
-CREATE INDEX pps_bom_dirty_ndx ON product_product_summary ( bom_dirty );
-CREATE INDEX pps_active_ndx ON product_product_summary ( active );
-CREATE INDEX pps_basic_search_ndx ON product_product_summary ( default_code, revision, active, type );
-
-
 
 CREATE OR REPLACE FUNCTION fn_trigger_stock_move_changes()
 RETURNS TRIGGER AS
@@ -367,7 +373,6 @@ FOR EACH ROW
 EXECUTE PROCEDURE   fn_trigger_stock_move_changes()
 ;
 
-
 CREATE TRIGGER      trig_stock_move_qty_changes_insdel
 BEFORE INSERT OR DELETE
 ON
@@ -375,8 +380,6 @@ ON
 FOR EACH ROW
 EXECUTE PROCEDURE   fn_trigger_stock_move_changes()
 ;
-
-
 
 DROP FUNCTION fn_get_cached_available_qty(product_id integer);
 CREATE OR REPLACE FUNCTION fn_get_cached_available_qty(product_id integer)
@@ -410,8 +413,6 @@ $$
 $$
 LANGUAGE plpython3u;
 
-
-
 CREATE OR REPLACE FUNCTION fn_sync_product_product_summary()
 RETURNS TEXT AS
 $$
@@ -420,6 +421,25 @@ $$
     return iplpy.sync_product_product_summary()
 $$
 LANGUAGE plpython3u;
+
+
+CREATE OR REPLACE FUNCTION fn_trigger_location_changes()
+RETURNS TRIGGER AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.trigger_location_changes()
+$$
+LANGUAGE plpython3u;
+
+CREATE TRIGGER      trig_location_changes_updel
+BEFORE UPDATE OF    active,
+                    location_id,
+ON
+                    stock_location
+FOR EACH ROW
+EXECUTE PROCEDURE   fn_trigger_location_changes()
+;
 
 
 
