@@ -257,6 +257,19 @@ class IPLPY(izaber.plpython.base.IPLPY):
 
         return "OK"
 
+    def mark_products_dirty(self,dirty_product_ids):
+        if dirty_product_ids:
+            self.q("""
+                UPDATE  product_product_dirty_tracker
+                SET
+                        qty_dirty='t'
+                WHERE
+                        id in ({dirty_product_ids})
+            """.format(
+                dirty_product_ids=",".join(map(str,dirty_product_ids))
+            ))
+
+
     def trigger_stock_move_changes(self):
         """ This trigger should execute when a stock.move is created.
             The purpose of this function is to flag in the
@@ -269,17 +282,7 @@ class IPLPY(izaber.plpython.base.IPLPY):
         for product_id in [ old.get('product_id'), new.get('product_id') ]:
             if not product_id: continue
             dirty_product_ids.append(product_id)
-
-        if dirty_product_ids:
-            self.q("""
-                UPDATE  product_product_dirty_tracker
-                SET
-                        qty_dirty='t'
-                WHERE
-                        id in ({dirty_product_ids})
-            """.format(
-                dirty_product_ids=",".join(map(str,dirty_product_ids))
-            ))
+        self.mark_products_dirty(dirty_product_ids)
 
     def trigger_location_changes(self):
         """ This trigger should execute when a location is changed
@@ -306,19 +309,48 @@ class IPLPY(izaber.plpython.base.IPLPY):
             product_id = row['product_id']
             if not product_id: continue
             dirty_product_ids.append(product_id)
-
-        if dirty_product_ids:
-            self.q("""
-                UPDATE  product_product_dirty_tracker
-                SET
-                        qty_dirty='t'
-                WHERE
-                        id in ({dirty_product_ids})
-            """.format(
-                dirty_product_ids=",".join(map(str,dirty_product_ids))
-            ))
+        self.mark_products_dirty(dirty_product_ids)
 
 
+    def trigger_uom_changes(self):
+        """ This trigger should execute when a uom is changed
+            The purpose of this function is to flag in the
+            product_product table what records will need quantity
+            recalculated
+        """
+        old = self.TD['old'] or {}
+        new = self.TD['new'] or {}
+
+        # Go through the stock_move list for any changes that might
+        data = self.q("""
+            SELECT  DISTINCT product_id
+            FROM    stock_move
+            WHERE
+                    product_uom = {uom_id}
+        """.format(
+            uom_id = old.get('id')
+        ))
+
+        dirty_product_ids = []
+        for row in data:
+            product_id = row['product_id']
+            if not product_id: continue
+            dirty_product_ids.append(product_id)
+        self.mark_products_dirty(dirty_product_ids)
+
+    def trigger_product_changes(self):
+        """ This trigger should execute when a product is changed.
+            The purpose of this function is to flag in the
+            product_product table what records will need quantity
+            recalculated
+        """
+        old = self.TD['old'] or {}
+        new = self.TD['new'] or {}
+        dirty_product_ids = []
+        for product_id in [ old.get('id'), new.get('id') ]:
+            if not product_id: continue
+            dirty_product_ids.append(product_id)
+        self.mark_products_dirty(dirty_product_ids)
 """
 
 CREATE OR REPLACE FUNCTION fn_uom_convert(from_uom_id integer,qty numeric,to_uom_id integer)
@@ -442,5 +474,43 @@ EXECUTE PROCEDURE   fn_trigger_location_changes()
 ;
 
 
+CREATE OR REPLACE FUNCTION fn_trigger_uom_changes()
+RETURNS TRIGGER AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.trigger_uom_changes()
+$$
+LANGUAGE plpython3u;
+
+CREATE TRIGGER      trig_uom_changes_updel
+BEFORE UPDATE OF    category_id,
+                    factor,
+                    rounding
+ON
+                    product_uom
+FOR EACH ROW
+EXECUTE PROCEDURE   fn_trigger_uom_changes()
+;
+
+
+
+
+CREATE OR REPLACE FUNCTION fn_trigger_product_changes()
+RETURNS TRIGGER AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.trigger_product_changes()
+$$
+LANGUAGE plpython3u;
+
+CREATE TRIGGER      trig_product_changes_updel
+BEFORE UPDATE OF    uom_id
+ON
+                    product_template
+FOR EACH ROW
+EXECUTE PROCEDURE   fn_trigger_product_changes()
+;
 
 """
