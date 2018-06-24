@@ -3,10 +3,130 @@ import pprint
 import izaber.plpython.base
 
 class IPLPY(izaber.plpython.base.IPLPY):
+    def info(self, *args):
+        self.plpy.info(*args)
+
     def rounding(self, f, r):
         if not r:
             return f
         return round(f / r) * r
+
+    def table_exists(self, table_name):
+        """ Returns True/False depending on if the table exists
+        """
+        result = self.q("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_tables
+                WHERE schemaname = 'public'
+                AND tablename = '{table_name}'
+            );
+        """.format(table_name=table_name))
+        return result[0]['exists']
+
+    def install(self):
+        """ Sets up the requisite tables and such in the database
+        """
+        if not self.table_exists('zerp_product_dirty_log'):
+
+            # Ensure our base table is present
+            self.q("""
+                CREATE TABLE IF NOT EXISTS zerp_product_dirty_log (
+                      id serial primary key,
+                      product_id integer not null,
+                      update_time timestamp not null,
+                      dirty boolean not null,
+                      cached_qty_available numeric,
+                      cached_virtual_available numeric,
+                      cached_incoming_qty numeric,
+                      cached_outgoing_qty numeric
+                )
+            """)
+
+            # Ensure we've got some data
+            self.q("""
+                INSERT INTO zerp_product_dirty_log
+                        (
+                            product_id, update_time, dirty,
+                            cached_qty_available,
+                            cached_virtual_available,
+                            cached_incoming_qty,
+                            cached_outgoing_qty
+                        )
+                SELECT
+                        id, now(), True,
+                        0, 0, 0, 0
+                FROM
+                        product_product;
+            """)
+
+            # Setup the index that allows fast lookup for the latest
+            # entries
+            self.q("""
+                CREATE INDEX ndx_zerp_product_dirty_log_update
+                ON           zerp_product_dirty_log
+                            ( product_id, update_time desc, id desc );
+            """)
+
+            # Request that the quantities be recalculated now
+            self.sync_product_product_summary();
+
+            # Provide methods to tell the system to sync up data
+            self.q("""
+                CREATE OR REPLACE FUNCTION fn_sync_product_product_summary()
+                RETURNS TEXT AS
+                $$
+                    from izaber.plpython.zerp import init_plpy
+                    iplpy = init_plpy(globals())
+                    return iplpy.sync_product_product_summary()
+                $$
+                LANGUAGE plpython3u;
+            """)
+            self.q("""
+                CREATE OR REPLACE FUNCTION fn_sync_product_product_summary(ids integer[])
+                RETURNS TEXT AS
+                $$
+                    from izaber.plpython.zerp import init_plpy
+                    iplpy = init_plpy(globals())
+                    return iplpy.sync_product_product_summary(ids)
+                $$
+                LANGUAGE plpython3u;
+            """)
+
+
+            # Ensure we can vacuum the database of too many entries
+            self.q("""
+                CREATE OR REPLACE FUNCTION fn_zerp_plpy_vacuum()
+                RETURNS TEXT AS
+                $$
+                    from izaber.plpython.zerp import init_plpy
+                    iplpy = init_plpy(globals())
+                    return iplpy.vacuum()
+                $$
+                LANGUAGE plpython3u
+            """)
+
+
+
+        return "Installed!"
+
+    def vacuum(self):
+        """ Cleans up the database. This may be slow so be careful when
+            this is called. Also call this when things are quiet since
+            this might cause concurrency issues during busy times.
+        """
+
+        # Delete all but the most recent entries from the log
+        self.q("""
+            DELETE FROM zerp_product_dirty_log
+            WHERE
+                    id not in (
+                        select distinct on (product_id) id
+                        from
+                            zerp_product_dirty_log
+                        order by product_id, update_time desc
+                    )
+        """)
 
     def get_uom_data(self, uom_id):
         """ Fetches basic information from DB about product.uom
@@ -193,80 +313,82 @@ class IPLPY(izaber.plpython.base.IPLPY):
         results = self.get_products_available([product_id])
         return pprint.pformat(results[product_id])
 
-    def sync_product_product_summary(self):
+    def sync_product_product_summary(self,ids=None):
         """ Clean up any dirty entries found in the summary table
+            If ids are provided, we focus on just those ids. If not,
+            we look at all the entries
         """
-
-        # Ensure all dirty tracker entries are present
-        self.q("""
-            INSERT  INTO product_product_dirty_tracker
-            ( id, qty_dirty )
-                SELECT      pp.id as id,'t'as qty_dirty
-                FROM        product_product pp
-                  LEFT JOIN product_product_dirty_tracker ppdt
-                         ON pp.id = ppdt.id
-                      WHERE ppdt.id is null
-        """)
-
-        # Ensure all dirty tracker entries reflect existing products
-        self.q("""
-            DELETE FROM     product_product_dirty_tracker
-            WHERE
-                            id NOT IN(
-                                SELECT  id
-                                FROM    product_product
-                            )
-        """)
 
         # Deal with the dirty product counts
         # We will process in batches to reduce memory impact
+        where_cond = ''
+        if ids:
+            where_cond = 'AND product_id in ({})'.format(",".join(map(str,ids)))
         cur = self.plpy.cursor("""
-                    SELECT  id
-                    FROM    product_product_dirty_tracker
-                    WHERE   qty_dirty = 't'
-                """)
+                    SELECT  product_id
+                    FROM (
+                            SELECT DISTINCT ON (product_id) product_id, dirty
+                            FROM zerp_product_dirty_log
+                            ORDER BY product_id, update_time desc, id desc
+                        ) a
+                    WHERE
+                            dirty = 't'
+                            {where_cond}
+                    ;
+                """.format(where_cond=where_cond))
         while True:
             rows = cur.fetch(100)
             if not rows:
                 break
             self.plpy.info("Syncing {} record(s)...".format(len(rows)))
-            product_ids = list(map(lambda a:a['id'], rows))
+            product_ids = list(map(lambda a:a['product_id'], rows))
             product_counts = self.get_products_available(product_ids)
             self.GD['product_counts'] = product_counts
 
-            self.q("""
-                UPDATE      product_product
-                SET
-                            cached_qty_available=fn_get_cached_available_qty(id),
-                            cached_virtual_available=fn_get_cached_virtual_available(id),
-                            cached_incoming_qty=fn_get_cached_incoming_qty(id),
-                            cached_outgoing_qty=fn_get_cached_outgoing_qty(id)
-                WHERE
-                            id IN ({product_ids})
-            """.format(
-                product_ids=",".join(map(str,product_ids)),
-            ))
-
-            self.q("""
-                UPDATE      product_product_dirty_tracker
-                SET         qty_dirty = 'f'
-                WHERE       id IN ({product_ids})
-            """.format(
-                product_ids=",".join(map(str,product_ids)),
-            ))
+            for product_id,vals in product_counts.items():
+                self.q("""
+                    INSERT INTO zerp_product_dirty_log
+                            (
+                                product_id, update_time, dirty,
+                                cached_qty_available,
+                                cached_virtual_available,
+                                cached_incoming_qty,
+                                cached_outgoing_qty
+                            )
+                    VALUES  (
+                                {product_id}, now(), 'f',
+                                {qty_available},
+                                {virtual_available},
+                                {incoming_qty},
+                                {outgoing_qty}
+                    )
+                """.format(
+                    product_id=product_id,
+                    **vals
+                ))
 
         return "OK"
 
     def mark_products_dirty(self,dirty_product_ids):
-        if dirty_product_ids:
+        if not dirty_product_ids:
+            return
+        for product_id in dirty_product_ids:
             self.q("""
-                UPDATE  product_product_dirty_tracker
-                SET
-                        qty_dirty='t'
-                WHERE
-                        id in ({dirty_product_ids})
+                INSERT INTO zerp_product_dirty_log
+                        (
+                            product_id, update_time, dirty,
+                            cached_qty_available,
+                            cached_virtual_available,
+                            cached_incoming_qty,
+                            cached_outgoing_qty
+                        )
+                        VALUES
+                        (
+                            {product_id}, now(), True,
+                            0, 0, 0, 0
+                        )
             """.format(
-                dirty_product_ids=",".join(map(str,dirty_product_ids))
+                product_id=product_id
             ))
 
 
@@ -310,7 +432,6 @@ class IPLPY(izaber.plpython.base.IPLPY):
             if not product_id: continue
             dirty_product_ids.append(product_id)
         self.mark_products_dirty(dirty_product_ids)
-
 
     def trigger_uom_changes(self):
         """ This trigger should execute when a uom is changed
@@ -512,5 +633,45 @@ ON
 FOR EACH ROW
 EXECUTE PROCEDURE   fn_trigger_product_changes()
 ;
+
+
+CREATE OR REPLACE FUNCTION fn_table_exists(table_name text)
+RETURNS BOOLEAN AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.table_exists(table_name)
+$$
+LANGUAGE plpython3u;
+
+
+CREATE OR REPLACE FUNCTION fn_zerp_plpy_install()
+RETURNS TEXT AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.install()
+$$
+LANGUAGE plpython3u;
+
+
+CREATE OR REPLACE FUNCTION fn_zerp_plpy_vacuum()
+RETURNS TEXT AS
+$$
+    from izaber.plpython.zerp import init_plpy
+    iplpy = init_plpy(globals())
+    return iplpy.vacuum()
+$$
+LANGUAGE plpython3u;
+
+
+
+CREATE OR REPLACE FUNCTION fn_zerp_plpy_test(ids integer[])
+RETURNS TEXT AS
+$$
+    plpy.info(ids)
+$$
+LANGUAGE plpython3u;
+
 
 """
