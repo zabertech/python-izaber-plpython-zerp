@@ -65,7 +65,7 @@ class IPLPY(izaber.plpython.base.IPLPY):
             self.q("""
                 CREATE INDEX ndx_zerp_product_dirty_log_update
                 ON           zerp_product_dirty_log
-                            ( product_id, update_time desc, id desc );
+                            ( product_id, update_time desc, dirty desc );
             """)
 
             # Request that the quantities be recalculated now
@@ -124,7 +124,7 @@ class IPLPY(izaber.plpython.base.IPLPY):
                         select distinct on (product_id) id
                         from
                             zerp_product_dirty_log
-                        order by product_id, update_time desc
+                        order by product_id, update_time desc, dirty desc
                     )
         """)
 
@@ -329,7 +329,7 @@ class IPLPY(izaber.plpython.base.IPLPY):
                     FROM (
                             SELECT DISTINCT ON (product_id) product_id, dirty
                             FROM zerp_product_dirty_log
-                            ORDER BY product_id, update_time desc, id desc
+                            ORDER BY product_id, update_time desc, dirty desc
                         ) a
                     WHERE
                             dirty = 't'
